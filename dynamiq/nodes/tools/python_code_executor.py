@@ -1,12 +1,16 @@
 import builtins
 import errno
 import importlib
+import importlib.util
 import inspect
 import io
 import json
 import os
 import shutil
 import tempfile
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -31,9 +35,79 @@ from dynamiq.types.cancellation import check_cancellation
 from dynamiq.utils import format_value
 from dynamiq.utils.logger import logger
 
+# The working directory belongs to the whole process, so code runs that change it take turns. A run that is still
+# going after its time limit gives its turn back, so that code that never returns does not stop the runs after it.
+_WORKSPACE_LOCK = threading.Lock()
+_WORKSPACE_OWNER_LOCK = threading.Lock()
+_workspace_owner: object | None = None
+_WORKSPACE_TIME_LIMIT_SECONDS = 300
+
+
+def _end_workspace_turn(run: object, original_cwd: str | None) -> None:
+    """Restore the working directory and let the next run start, unless the run already gave up its turn."""
+    global _workspace_owner
+    with _WORKSPACE_OWNER_LOCK:
+        if _workspace_owner is run:
+            _workspace_owner = None
+            if original_cwd is not None:
+                os.chdir(original_cwd)
+            _WORKSPACE_LOCK.release()
+
+
+@contextmanager
+def _workspace_directory(time_limit_seconds: float | None = None) -> Iterator[str]:
+    """Run in a new temporary working directory, then restore the old one and delete the new one."""
+    global _workspace_owner
+    time_limit_seconds = time_limit_seconds or _WORKSPACE_TIME_LIMIT_SECONDS
+    if not _WORKSPACE_LOCK.acquire(timeout=time_limit_seconds):
+        raise ToolExecutionException(
+            "Another Python code execution in this process is still running. Try again later.", recoverable=True
+        )
+    run = object()
+    with _WORKSPACE_OWNER_LOCK:
+        _workspace_owner = run
+    original_cwd = workspace_dir = give_up = None
+    try:
+        original_cwd = os.getcwd()
+        workspace_dir = tempfile.mkdtemp(prefix="dynamiq_executor_")
+        os.chdir(workspace_dir)
+        give_up = threading.Timer(time_limit_seconds, _end_workspace_turn, args=(run, original_cwd))
+        give_up.daemon = True
+        give_up.start()
+        yield workspace_dir
+    finally:
+        if give_up:
+            give_up.cancel()
+        _end_workspace_turn(run, original_cwd)
+        if workspace_dir:
+            shutil.rmtree(workspace_dir, ignore_errors=True)
+
+
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 OPTIONAL_PRELOAD_MODULES: tuple[tuple[str, str | None], ...] = (("seaborn", "sns"),)
+
+
+def _describe_libraries() -> str:
+    """Describe the libraries the code can use.
+
+    pdfplumber and the plotting libraries come with extras, so they are left out when they are not installed.
+    """
+    libraries = ["pandas", "numpy", "requests"]
+    if importlib.util.find_spec("pdfplumber"):
+        libraries.append("pdfplumber")
+    libraries += ["pypdf", "docx (python-docx)", "pptx (python-pptx)", "openpyxl"]
+    if not (importlib.util.find_spec("matplotlib") and importlib.util.find_spec("seaborn")):
+        return f"Available libraries include: {', '.join(libraries)}, and the standard library. "
+    libraries.append("seaborn (preloaded as `sns` and the default for plotting)")
+    return (
+        "Matplotlib is forced onto the 'Agg' backend so you can always render plots headlessly with "
+        "`plt.savefig(...)` (no GUI popups). "
+        f"Available libraries include: {', '.join(libraries)}, and the standard library. "
+        "Default to seaborn for charting so plots render consistently without extra setup. Seaborn is already "
+        "injected as `sns`, but explicit `import seaborn as sns` or `import matplotlib.pyplot as plt` statements are "
+        "also permitted if you prefer. "
+    )
 
 
 class PythonCodeExecutorFileWorkspace(BaseModel):
@@ -264,18 +338,7 @@ class PythonCodeExecutor(Node):
         "when you need metadata, binary vs text detection, or want a "
         "consistent API—so prefer read_file()/write_file(), "
         "list_files(), file_exists(), describe_file(), etc., or"
-        " call them via `helpers['read_file']('foo.csv')`. Matplotlib "
-        "is forced onto the 'Agg' backend so you can always render"
-        " plots headlessly with `plt.savefig(...)` (no GUI popups). "
-        "Available libraries include: pandas, numpy, "
-        "requests, pdfplumber, pypdf, docx (python-docx), "
-        "pptx (python-pptx), markdown, openpyxl, "
-        "seaborn (preloaded as `sns` and the default for plotting), and the "
-        "standard library. Default to seaborn for"
-        " charting so plots render consistently without extra setup. Seaborn is "
-        "already injected as `sns`, but explicit "
-        "`import seaborn as sns` or `import matplotlib.pyplot as plt` statements "
-        "are also permitted if you prefer. Write normal Python "
+        " call them via `helpers['read_file']('foo.csv')`. " + _describe_libraries() + "Write normal Python "
         "exactly as it would appear in a `.py` file—use literal "
         "newlines instead of escaping them, "
         "and avoid JSON-style quoting inside the source. Any "
@@ -339,12 +402,7 @@ class PythonCodeExecutor(Node):
         )
         restricted_globals.update(self._preload_optional_modules())
 
-        workspace_dir = tempfile.mkdtemp(prefix="dynamiq_executor_")
-        original_cwd = os.getcwd()
-
-        try:
-            os.chdir(workspace_dir)
-
+        with _workspace_directory(self.error_handling.timeout_seconds) as workspace_dir:
             files, mapped_inputs, workspace_paths = self._normalize_files(input_data.files)
             self._materialize_inline_files(files, workspace_dir)
             self._materialize_file_store_contents(workspace_dir, workspace_paths)
@@ -390,9 +448,6 @@ class PythonCodeExecutor(Node):
             if stdout_value:
                 logger.debug(f"Tool {self.name} - {self.id}: captured stdout ({len(stdout_value)} chars).")
             return {"content": sanitized_content}
-        finally:
-            os.chdir(original_cwd)
-            shutil.rmtree(workspace_dir, ignore_errors=True)
 
     def _normalize_files(
         self, files: list[Any] | FileMappedInput | None
